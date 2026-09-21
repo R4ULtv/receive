@@ -407,6 +407,18 @@ impl Receive {
                         .filter_map(|address| crate::model::domain_of(address)),
                 );
             }
+            // The people who wrote to you are other people's domains too. The
+            // reader puts a face on each message of the conversation that is
+            // open, so ask for those and no others.
+            if self.screen == Screen::Mail {
+                wanted.extend(
+                    self.selected_thread()
+                        .map(|thread| self.conversation(thread))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|index| crate::model::domain_of(&self.emails[index].from)),
+                );
+            }
             for domain in wanted {
                 if self.asked_for_icon.insert(domain.clone()) {
                     let _ = self.icons.wanted.send(domain);
@@ -431,6 +443,38 @@ impl Receive {
                 .into_any_element(),
             None => glyph(muted).into_any_element(),
         }
+    }
+
+    /// The face beside a message: the sender's domain favicon once Receive
+    /// has it, and the initial of their name until then, or if the domain
+    /// has none. [`Self::address_mark`] is the same idea at list size.
+    fn correspondent(&self, address: &str, size: Pixels, cx: &App) -> AnyElement {
+        let icon = crate::model::domain_of(address)
+            .and_then(|domain| self.icon_files.get(&domain).cloned());
+        let letter = initial(address);
+        div()
+            .size(size)
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(theme::surface(cx))
+            .border_1()
+            .border_color(theme::line(cx))
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .child(match icon {
+                // A file that turns out not to decode falls back like a
+                // missing one, the same way the domain chips do.
+                Some(icon) => img(icon)
+                    .size(size * 0.62)
+                    .with_fallback(move || div().child(letter.clone()).into_any_element())
+                    .into_any_element(),
+                None => div().child(letter).into_any_element(),
+            })
+            .into_any_element()
     }
 
     fn current_draft(&self, cx: &App) -> Draft {
@@ -536,6 +580,7 @@ impl Receive {
         };
         self.selected = Some(key);
         self.open_message = None;
+        self.icons_dirty = true;
         self.mark_read(self.conversation(thread), true, cx);
         if let Some(index) = self.open_email() {
             self.show_message(index, window, cx);
@@ -1332,23 +1377,6 @@ pub fn initial(address: &str) -> String {
         .unwrap_or('?')
         .to_uppercase()
         .to_string()
-}
-
-/// A circle carrying a correspondent's initial.
-pub fn avatar(address: &str, size: Pixels, cx: &App) -> impl IntoElement {
-    div()
-        .size(size)
-        .flex_shrink_0()
-        .rounded_full()
-        .bg(theme::surface(cx))
-        .border_1()
-        .border_color(theme::line(cx))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .child(initial(address))
 }
 
 pub fn short_date(value: &str) -> String {

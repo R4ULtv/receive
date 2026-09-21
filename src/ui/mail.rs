@@ -1,6 +1,6 @@
 //! The two mail panes: the list of messages and the message being read.
 
-use super::{Receive, Screen, View, avatar, long_date, short_date, theme};
+use super::{Receive, Screen, View, long_date, short_date, theme};
 use crate::{
     model::{Email, Folder},
     worker::Command,
@@ -549,7 +549,7 @@ impl Receive {
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().list_hover))
             .on_click(cx.listener(move |this, _, window, cx| this.show(id.clone(), window, cx)))
-            .child(avatar(&email.from, px(22.), cx))
+            .child(self.correspondent(&email.from, px(22.), cx))
             .child(
                 div()
                     .flex_shrink_0()
@@ -597,7 +597,7 @@ impl Receive {
                         h_flex()
                             .gap_3()
                             .items_center()
-                            .child(avatar(&email.from, px(36.), cx))
+                            .child(self.correspondent(&email.from, px(36.), cx))
                             .child(
                                 v_flex()
                                     .flex_1()
