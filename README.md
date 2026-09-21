@@ -16,12 +16,10 @@ It connects directly to Resend. There's no separate server to set up.
 
 ## Try it
 
-Receive is shared as source code. Install [Rust](https://rustup.rs), plus the tools for your device:
+Receive is shared as source code only; there are no prebuilt downloads. Install [Rust](https://rustup.rs), plus the tools for your device:
 
 - **Windows:** Visual Studio Build Tools with **Desktop development with C++** and a Windows SDK.
 - **Mac:** macOS 15 or later and Xcode Command Line Tools, which you can install with `xcode-select --install` in Terminal. Apple Silicon meets the [UI framework's requirements](https://github.com/longbridge/gpui-kit/blob/main/website/docs/installation.md).
-
-Windows has been tested. The project is configured for macOS too, but still needs to be built and tried on a Mac.
 
 From the project folder, run:
 
@@ -34,17 +32,6 @@ The first run takes a while to compile. To look around with sample messages with
 ```sh
 cargo run -- --preview
 ```
-
-### Mac app icon
-
-The Receive icon is included for the Dock when you use `cargo run`. To get a local app you can open from Finder or drag to your Dock, run this on your Mac:
-
-```sh
-bash tools/macos-app.sh
-open target/Receive.app
-```
-
-This creates a local `Receive.app` using the normal development build. Run the script again after updating the source. The Mac icon still needs visual testing on a Mac.
 
 ## Connect your account
 
@@ -65,8 +52,6 @@ Keep Receive open to download and check for mail. It can keep messages it has al
 You can use the same Resend account on your Windows PC and Mac; sign in separately on each device. Drafts, read/unread status, and downloaded archives are local to each device and don't sync between them.
 
 Large mailboxes may be slow, and multiple simultaneous accounts aren't supported. If you sign in through your browser, run only one copy of Receive per device at a time.
-
-For development checks and more detailed limitations, see the [review notes](REVIEW.md).
 
 ## Built with
 
