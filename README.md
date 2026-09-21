@@ -35,6 +35,17 @@ The first run takes a while to compile. To look around with sample messages with
 cargo run -- --preview
 ```
 
+### Mac app icon
+
+The Receive icon is included for the Dock when you use `cargo run`. To get a local app you can open from Finder or drag to your Dock, run this on your Mac:
+
+```sh
+bash tools/macos-app.sh
+open target/Receive.app
+```
+
+This creates a local `Receive.app` using the normal development build. Run the script again after updating the source. The Mac icon still needs visual testing on a Mac.
+
 ## Connect your account
 
 1. Open **Settings > Connect Resend** and sign in through your browser, or enter a **Full access** Resend API key.
@@ -59,7 +70,7 @@ For development checks and more detailed limitations, see the [review notes](REV
 
 ## Built with
 
-Rust and [GPUI Kit](https://github.com/longbridge/gpui-kit).
+Rust, [GPUI Kit](https://github.com/longbridge/gpui-kit), and Resend's official [resend-rs](https://resend.com/docs/send-with-rust) SDK.
 
 ## License
 
