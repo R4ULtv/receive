@@ -1,6 +1,6 @@
 //! The two mail panes: the list of messages and the message being read.
 
-use super::{Receive, Screen, avatar, long_date, short_date, theme};
+use super::{Receive, Screen, View, avatar, long_date, short_date, theme};
 use crate::{
     model::{Email, Folder},
     worker::Command,
@@ -9,6 +9,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     button::*,
     input::{Input, Textarea},
+    tooltip::Tooltip,
     *,
 };
 use gpui_kit::{prelude::*, *};
@@ -23,8 +24,8 @@ const SEARCH_HEIGHT: Pixels = px(36.);
 
 impl Receive {
     pub(super) fn message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let emails = self.visible(cx);
-        let count = emails.len();
+        let threads = self.visible(cx);
+        let count = threads.len();
         let searching = !self.search.read(cx).value().is_empty();
         v_flex()
             .w(LIST_WIDTH)
@@ -52,7 +53,7 @@ impl Receive {
                                         div()
                                             .text_lg()
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child(self.folder.name()),
+                                            .child(self.view.name()),
                                     )
                                     .child(
                                         div()
@@ -108,8 +109,8 @@ impl Receive {
                     count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                         range
-                            .filter_map(|index| this.emails.get(emails[index]))
-                            .map(|email| this.message_row(email, cx))
+                            .filter_map(|index| threads.get(index).copied())
+                            .map(|thread| this.thread_row(thread, cx))
                             .collect::<Vec<_>>()
                     }),
                 )
@@ -121,8 +122,10 @@ impl Receive {
     /// What the list says when it has nothing to show.
     fn list_placeholder(&self, searching: bool, cx: &App) -> impl IntoElement {
         let message = if searching {
-            "No messages match your search."
-        } else if self.folder == Folder::Sent {
+            "No conversations match your search."
+        } else if self.view == View::Archive {
+            "Conversations you archive are kept here. Archiving is local: Resend still has them."
+        } else if self.view == View::Sent {
             "Messages you send appear here."
         } else if self.connected || self.preview {
             "No messages here yet."
@@ -139,28 +142,57 @@ impl Receive {
             .child(message)
     }
 
-    fn message_row(&self, email: &Email, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let selected = self.selected.as_deref() == Some(&email.id);
-        let id = email.id.clone();
-        let correspondent = if self.folder == Folder::Sent {
-            email
+    /// One conversation in the list.
+    ///
+    /// A conversation is named by everyone who wrote in it, carries the
+    /// subject it started with, and previews the message that arrived last.
+    fn thread_row(&self, thread: usize, cx: &mut Context<Self>) -> AnyElement {
+        let messages = self.conversation(thread);
+        let (Some(&first), Some(&last)) = (messages.first(), messages.last()) else {
+            // A conversation with nothing in view is filtered out before here.
+            return div().h(ROW_HEIGHT).into_any_element();
+        };
+        let (oldest, newest) = (&self.emails[first], &self.emails[last]);
+        let key = self.threads[thread].key.clone();
+        let selected = self.selected.as_deref() == Some(key.as_str());
+        let unread = messages.iter().any(|&index| !self.emails[index].read);
+        let archived = self.view == View::Archive;
+        let count = messages.len();
+        let attachments = messages
+            .iter()
+            .any(|&index| !self.emails[index].attachments.is_empty());
+        // Every name that wrote, oldest first, so a conversation reads as the
+        // exchange it is rather than as its most recent message.
+        let correspondents = if self.view == View::Sent {
+            newest
                 .to
                 .iter()
                 .map(|address| super::display_name(address))
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
-            super::display_name(&email.from)
+            let mut names: Vec<String> = Vec::new();
+            for &index in &messages {
+                let name = super::display_name(&self.emails[index].from);
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            names.join(", ")
         };
-        let subject = if email.subject.trim().is_empty() {
+        let subject = if oldest.subject.trim().is_empty() {
             "(No subject)".to_string()
         } else {
-            email.subject.clone()
+            oldest.subject.clone()
         };
-        let unread = !email.read;
+        // Row controls are revealed by hovering the row they belong to, so the
+        // list stays a list until it is being used.
+        let group = SharedString::from(format!("row-{key}"));
+        let hint = theme::line(cx);
 
         v_flex()
-            .id(SharedString::from(format!("email-{}", email.id)))
+            .id(SharedString::from(format!("thread-{key}")))
+            .group(group.clone())
             .h(ROW_HEIGHT)
             .w_full()
             .px_5()
@@ -179,21 +211,54 @@ impl Receive {
             })
             .cursor_pointer()
             .overflow_hidden()
-            .on_click(cx.listener(move |this, _, window, cx| this.select(id.clone(), window, cx)))
+            .on_click(cx.listener({
+                let key = key.clone();
+                move |this, _, window, cx| this.select(key.clone(), window, cx)
+            }))
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
                     .child(
+                        // The unread mark is also the control that sets it.
                         div()
-                            .size(px(6.))
+                            .id(SharedString::from(format!("read-{key}")))
                             .flex_shrink_0()
-                            .rounded_full()
-                            .bg(if unread {
-                                cx.theme().foreground
-                            } else {
-                                cx.theme().transparent
-                            }),
+                            .size(px(14.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(if unread {
+                                    "Mark as read"
+                                } else {
+                                    "Mark as unread"
+                                })
+                                .build(window, cx)
+                            })
+                            .on_click(cx.listener({
+                                let key = key.clone();
+                                move |this, _, _, cx| {
+                                    // Otherwise the row underneath opens the
+                                    // conversation and reads it straight back.
+                                    cx.stop_propagation();
+                                    this.toggle_read(key.clone(), cx);
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(if unread {
+                                        cx.theme().foreground
+                                    } else {
+                                        cx.theme().transparent
+                                    })
+                                    .when(!unread, |this| {
+                                        this.group_hover(group.clone(), move |s| s.bg(hint))
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -206,14 +271,54 @@ impl Receive {
                             } else {
                                 FontWeight::NORMAL
                             })
-                            .child(correspondent),
+                            .child(correspondents),
                     )
+                    .when(count > 1, |this| {
+                        this.child(
+                            div()
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded(cx.theme().radius)
+                                .bg(theme::surface(cx))
+                                .text_xs()
+                                .text_color(theme::muted(cx))
+                                .child(count.to_string()),
+                        )
+                    })
                     .child(
                         div()
                             .flex_shrink_0()
                             .text_xs()
                             .text_color(theme::muted(cx))
-                            .child(short_date(&email.created_at)),
+                            .child(short_date(&newest.created_at)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .opacity(0.)
+                            .group_hover(group.clone(), |s| s.opacity(1.))
+                            .child(
+                                Button::new(SharedString::from(format!("archive-{key}")))
+                                    .ghost()
+                                    .small()
+                                    .icon(if archived {
+                                        IconName::ArchiveRestore
+                                    } else {
+                                        IconName::Archive
+                                    })
+                                    .tooltip(if archived {
+                                        "Move back to its folder"
+                                    } else {
+                                        "Archive on this computer"
+                                    })
+                                    .on_click(cx.listener({
+                                        let key = key.clone();
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.archive_thread(key.clone(), !archived, cx);
+                                        }
+                                    })),
+                            ),
                     ),
             )
             .child(
@@ -222,7 +327,7 @@ impl Receive {
                     .gap_2()
                     .items_center()
                     .child(div().flex_1().min_w_0().truncate().text_sm().child(subject))
-                    .when(!email.attachments.is_empty(), |this| {
+                    .when(attachments, |this| {
                         this.child(
                             Icon::new(IconName::Paperclip)
                                 .xsmall()
@@ -237,17 +342,42 @@ impl Receive {
                     .items_center()
                     .text_xs()
                     .text_color(theme::muted(cx))
-                    .child(div().flex_1().min_w_0().truncate().child(email.preview()))
-                    .when(email.folder == Folder::Sent, |this| {
-                        this.child(delivery_badge(email, cx))
+                    .child(div().flex_1().min_w_0().truncate().child(newest.preview()))
+                    .when(newest.folder == Folder::Sent, |this| {
+                        this.child(delivery_badge(newest, cx))
                     }),
             )
+            .into_any_element()
     }
 
+    /// The conversation being read: its messages in order, with one of them
+    /// open. Both folders are shown, so a reply sits with what it answered.
     pub(super) fn reader(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(email) = self.selected_email() else {
+        let Some(thread) = self.selected_thread() else {
             return self.reader_placeholder(cx).into_any_element();
         };
+        let messages = self.conversation(thread);
+        let Some(open) = self.open_email() else {
+            return self.reader_placeholder(cx).into_any_element();
+        };
+        let key = self.threads[thread].key.clone();
+        let email = &self.emails[open];
+        let archived = self.view == View::Archive;
+        let count = messages.len();
+        let position = messages
+            .iter()
+            .position(|&index| index == open)
+            .unwrap_or_default();
+        let subject = {
+            let oldest = &self.emails[messages[0]];
+            if oldest.subject.trim().is_empty() {
+                "(No subject)".to_string()
+            } else {
+                oldest.subject.clone()
+            }
+        };
+        let url = email.dashboard_url();
+
         v_flex()
             .flex_1()
             .h_full()
@@ -270,18 +400,60 @@ impl Receive {
                             .text_xs()
                             .text_color(theme::muted(cx))
                             .child(Icon::new(IconName::Mail).xsmall())
-                            .child(if self.preview { "Sample" } else { "Message" }),
+                            .child(match (self.preview, count) {
+                                (true, 1) => "Sample".to_string(),
+                                (true, count) => format!("Sample · {count} messages"),
+                                (false, 1) => "Message".to_string(),
+                                (false, count) => format!("Conversation · {count} messages"),
+                            }),
                     )
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
+                            .child(
+                                Button::new("mark-unread")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Mail)
+                                    .tooltip(if count > 1 {
+                                        "Mark the conversation unread"
+                                    } else {
+                                        "Mark as unread"
+                                    })
+                                    .on_click(cx.listener({
+                                        let key = key.clone();
+                                        move |this, _, _, cx| {
+                                            this.mark_thread_unread(key.clone(), cx)
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("archive")
+                                    .ghost()
+                                    .small()
+                                    .icon(if archived {
+                                        IconName::ArchiveRestore
+                                    } else {
+                                        IconName::Archive
+                                    })
+                                    .tooltip(if archived {
+                                        "Move back to its folder"
+                                    } else {
+                                        "Archive on this computer. Resend keeps the message."
+                                    })
+                                    .on_click(cx.listener({
+                                        let key = key.clone();
+                                        move |this, _, _, cx| {
+                                            this.archive_thread(key.clone(), !archived, cx)
+                                        }
+                                    })),
+                            )
                             .child({
                                 // Whatever Receive leaves out — the original
                                 // HTML, the raw source, the attachments — is a
                                 // click away on the dashboard. Sample messages
                                 // have invented ids and no page to open.
-                                let url = email.dashboard_url();
                                 Button::new("open-on-resend")
                                     .ghost()
                                     .small()
@@ -299,7 +471,7 @@ impl Receive {
                                     .disabled(
                                         self.busy
                                             || !email.body_loaded
-                                            || self.folder == Folder::Sent,
+                                            || email.folder == Folder::Sent,
                                     )
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.reply(window, cx)),
@@ -317,65 +489,181 @@ impl Receive {
                         v_flex()
                             .px_8()
                             .pt_7()
-                            .pb_5()
-                            .gap_5()
+                            .pb_4()
                             .flex_shrink_0()
-                            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child(
-                                if email.subject.trim().is_empty() {
-                                    "(No subject)".to_string()
-                                } else {
-                                    email.subject.clone()
-                                },
-                            ))
                             .child(
-                                h_flex()
-                                    .gap_3()
-                                    .items_center()
-                                    .child(avatar(&email.from, px(36.), cx))
+                                div()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(subject),
+                            )
+                            .when(archived, |this| {
+                                this.child(
+                                    div()
+                                        .pt_1p5()
+                                        .text_xs()
+                                        .text_color(theme::muted(cx))
+                                        .child("Archived on this computer. Resend still has it."),
+                                )
+                            }),
+                    )
+                    .child(self.folded("earlier-messages", &messages[..position], cx))
+                    .child(self.open_message_pane(open, count == 1, cx))
+                    .child(self.folded("later-messages", &messages[position + 1..], cx)),
+            )
+            .into_any_element()
+    }
+
+    /// The messages of the conversation that are not the one being read.
+    /// A long exchange scrolls rather than crowding out the message itself.
+    fn folded(&self, id: &'static str, messages: &[usize], cx: &mut Context<Self>) -> AnyElement {
+        if messages.is_empty() {
+            return div().into_any_element();
+        }
+        v_flex()
+            .id(id)
+            .flex_shrink_0()
+            .max_h(px(168.))
+            .overflow_y_scroll()
+            .children(
+                messages
+                    .iter()
+                    .map(|&index| self.folded_row(index, cx))
+                    .collect::<Vec<_>>(),
+            )
+            .into_any_element()
+    }
+
+    fn folded_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let email = &self.emails[index];
+        let id = email.id.clone();
+        h_flex()
+            .id(SharedString::from(format!("folded-{id}")))
+            .h(px(44.))
+            .flex_shrink_0()
+            .px_8()
+            .gap_3()
+            .items_center()
+            .border_t_1()
+            .border_color(theme::line(cx))
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().list_hover))
+            .on_click(cx.listener(move |this, _, window, cx| this.show(id.clone(), window, cx)))
+            .child(avatar(&email.from, px(22.), cx))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(super::display_name(&email.from)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::muted(cx))
+                    .child(email.preview()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme::muted(cx))
+                    .child(short_date(&email.created_at)),
+            )
+            .into_any_element()
+    }
+
+    /// The one message of the conversation shown in full.
+    fn open_message_pane(&self, index: usize, alone: bool, cx: &mut Context<Self>) -> AnyElement {
+        let email = &self.emails[index];
+        let id = email.id.clone();
+        let archived = self.view == View::Archive;
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .border_t_1()
+            .border_color(theme::line(cx))
+            .child(
+                v_flex()
+                    .px_8()
+                    .pt_5()
+                    .pb_4()
+                    .gap_4()
+                    .flex_shrink_0()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(avatar(&email.from, px(36.), cx))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
                                     .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_0p5()
-                                            .child(
-                                                div()
-                                                    .truncate()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .child(email.from.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .truncate()
-                                                    .text_xs()
-                                                    .text_color(theme::muted(cx))
-                                                    .child(format!("To {}", email.to.join(", "))),
-                                            ),
+                                        div()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(email.from.clone()),
                                     )
                                     .child(
                                         div()
-                                            .flex_shrink_0()
+                                            .truncate()
                                             .text_xs()
                                             .text_color(theme::muted(cx))
-                                            .child(long_date(&email.created_at)),
+                                            .child(format!("To {}", email.to.join(", "))),
                                     ),
                             )
-                            .when(email.folder == Folder::Sent, |this| {
-                                this.child(self.delivery_details(email, cx))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(theme::muted(cx))
+                                    .child(long_date(&email.created_at)),
+                            )
+                            // Filing one message of an exchange away, rather
+                            // than the whole of it. On its own the header
+                            // button already says the same thing.
+                            .when(!alone, |this| {
+                                this.child(
+                                    Button::new("archive-message")
+                                        .ghost()
+                                        .small()
+                                        .icon(if archived {
+                                            IconName::ArchiveRestore
+                                        } else {
+                                            IconName::Archive
+                                        })
+                                        .tooltip(if archived {
+                                            "Move this message back"
+                                        } else {
+                                            "Archive this message only"
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.archive_message(id.clone(), !archived, cx)
+                                        })),
+                                )
                             }),
                     )
-                    .child(
-                        div().px_7().pb_6().flex_1().min_h_0().child(
-                            Textarea::new(&self.reader)
-                                .readonly(true)
-                                .appearance(false)
-                                .h_full(),
-                        ),
-                    )
-                    .when(!email.attachments.is_empty(), |this| {
-                        this.child(self.attachments(email, cx))
+                    .when(email.folder == Folder::Sent, |this| {
+                        this.child(self.delivery_details(email, cx))
                     }),
             )
+            .child(
+                div().px_7().pb_6().flex_1().min_h_0().child(
+                    Textarea::new(&self.reader)
+                        .readonly(true)
+                        .appearance(false)
+                        .h_full(),
+                ),
+            )
+            .when(!email.attachments.is_empty(), |this| {
+                this.child(self.attachments(email, cx))
+            })
             .into_any_element()
     }
 

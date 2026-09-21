@@ -11,6 +11,8 @@ use std::borrow::Cow;
 gpui_kit::assets::icon_assets!(
     MailIcons,
     [
+        Archive,
+        ArchiveRestore,
         AtSign,
         Clock,
         KeyRound,
@@ -65,6 +67,8 @@ mod tests {
     /// as empty space instead of failing, which is easy to miss by eye, so the
     /// whole list is resolved here.
     const DRAWN: &[IconName] = &[
+        IconName::Archive,
+        IconName::ArchiveRestore,
         IconName::AtSign,
         IconName::CircleCheck,
         IconName::Clock,

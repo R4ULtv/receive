@@ -172,6 +172,10 @@ pub struct Email {
     pub folder: Folder,
     #[serde(default)]
     pub read: bool,
+    /// Hidden from the folder lists and shown in the Archive view instead.
+    /// Local only: archiving never asks Resend to delete anything.
+    #[serde(default)]
+    pub archived: bool,
     #[serde(default)]
     pub body_loaded: bool,
     #[serde(default)]
@@ -261,16 +265,68 @@ impl Email {
         };
         format!("{DASHBOARD}/{page}/{}", self.id)
     }
-    pub fn references(&self) -> String {
-        let previous = self
-            .headers
+    /// A header by name, whatever case the sending server wrote it in.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("references"))
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
-            .unwrap_or("");
+    }
+    pub fn references(&self) -> String {
+        let previous = self.header("references").unwrap_or("");
         format!("{} {}", previous, self.message_id.as_deref().unwrap_or(""))
             .trim()
             .into()
+    }
+    /// Every Message-ID this message is known by or points at: its own, the one
+    /// it answers, and the chain it inherited. Two messages sharing any of
+    /// these belong to one conversation.
+    ///
+    /// Resend returns headers for received mail only; sent mail carries
+    /// whatever [`crate::worker`] recorded when the reply left.
+    pub fn thread_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .message_id
+            .iter()
+            .map(String::as_str)
+            .chain(self.header("references").into_iter().flat_map(str::split_whitespace))
+            .chain(self.header("in-reply-to").into_iter().flat_map(str::split_whitespace))
+            .filter_map(normalize_message_id)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+    /// The subject with its reply and forward prefixes removed, so that
+    /// `Re: Fwd: Notes` and `Notes` fall together. Used only to rescue mail
+    /// that carries no usable headers.
+    pub fn normalized_subject(&self) -> String {
+        let mut subject = self.subject.trim();
+        loop {
+            let stripped = ["re:", "fwd:", "fw:", "aw:", "sv:", "vs:", "antw:"]
+                .iter()
+                .find_map(|prefix| {
+                    subject
+                        .get(..prefix.len())
+                        .filter(|start| start.eq_ignore_ascii_case(prefix))
+                        .map(|_| subject[prefix.len()..].trim_start())
+                });
+            match stripped {
+                Some(rest) => subject = rest,
+                None => break,
+            }
+        }
+        subject.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    }
+    /// Every mailbox on this message, so a subject match can be checked
+    /// against the people involved before it joins two conversations.
+    pub fn participants(&self) -> std::collections::BTreeSet<String> {
+        std::iter::once(&self.from)
+            .chain(&self.to)
+            .chain(&self.cc)
+            .chain(&self.reply_to)
+            .filter_map(|address| mailbox_of(address))
+            .collect()
     }
 }
 
@@ -333,6 +389,18 @@ pub fn domains_of(emails: &[Email]) -> Vec<String> {
     domains.sort();
     domains.dedup();
     domains
+}
+
+/// A Message-ID without its angle brackets or surrounding space, lowercased,
+/// so that one identifier is recognised however a server wrote it. A value
+/// that holds no identifier at all is not one.
+fn normalize_message_id(value: &str) -> Option<String> {
+    let trimmed = value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_lowercase())
 }
 
 /// The address inside `Maya Chen <maya@example.com>`, or the whole value when
@@ -402,6 +470,83 @@ pub fn demo_messages() -> Vec<Email> {
         text: Some(body.into()), created_at: (chrono::Utc::now() - chrono::Duration::hours(i as i64 * 3)).to_rfc3339(),
         message_id: Some(format!("<demo-{i}@example.com>")), read, body_loaded: true, ..Default::default()
     }).collect();
+    // An exchange that crosses both folders, so the preview shows what
+    // threading is for: the reply sits with the message it answers.
+    let conversation = [
+        (
+            "demo-thread-1",
+            Folder::Inbox,
+            "Maya Chen <maya@example.com>",
+            "you@yourdomain.com",
+            "Where should replies live?",
+            "One thing I keep wanting: when I answer something, I want the answer filed with the message it answers, not off in a Sent folder I have to go and find.\n\nMaya",
+            30,
+            None,
+        ),
+        (
+            "demo-thread-2",
+            Folder::Sent,
+            "You <you@yourdomain.com>",
+            "Maya Chen <maya@example.com>",
+            "Re: Where should replies live?",
+            "Agreed. A conversation is one thing, so it reads as one thing — whichever folder each message happened to arrive in.",
+            28,
+            Some("<demo-thread-1@example.com>"),
+        ),
+        (
+            "demo-thread-3",
+            Folder::Inbox,
+            "Maya Chen <maya@example.com>",
+            "you@yourdomain.com",
+            "Re: Where should replies live?",
+            "That is exactly it. Nothing to go and find.",
+            26,
+            Some("<demo-thread-2@example.com>"),
+        ),
+    ];
+    let mut chain = String::new();
+    for (id, folder, from, to, subject, body, hours, answering) in conversation {
+        let mut headers = BTreeMap::new();
+        if let Some(answering) = answering {
+            headers.insert("In-Reply-To".into(), answering.to_string());
+            headers.insert("References".into(), chain.trim().to_string());
+        }
+        chain = format!("{chain} <{id}@example.com>");
+        messages.push(Email {
+            id: id.into(),
+            from: from.into(),
+            to: vec![to.into()],
+            subject: subject.into(),
+            text: Some(body.into()),
+            created_at: (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339(),
+            message_id: Some(format!("<{id}@example.com>")),
+            headers,
+            folder,
+            read: true,
+            body_loaded: true,
+            last_event: (folder == Folder::Sent).then_some(DeliveryStatus::Delivered),
+            status_checked_at: (folder == Folder::Sent)
+                .then(|| chrono::Utc::now().to_rfc3339()),
+            ..Default::default()
+        });
+    }
+    // Something on the shelf, so the Archive view is not empty in the preview.
+    messages.push(Email {
+        id: "demo-archived".into(),
+        from: "Studio North <hello@example.com>".into(),
+        to: vec!["hello@studio.dev".into()],
+        subject: "Last week's summary".into(),
+        text: Some(
+            "Nothing here needs an answer. Archiving is Receive's own shelf: the message stays on this computer and Resend still has its copy."
+                .into(),
+        ),
+        created_at: (chrono::Utc::now() - chrono::Duration::days(4)).to_rfc3339(),
+        message_id: Some("<demo-archived@example.com>".into()),
+        read: true,
+        archived: true,
+        body_loaded: true,
+        ..Default::default()
+    });
     for (id, status, subject) in [
         (
             "demo-delivered",
@@ -698,6 +843,29 @@ mod tests {
         let preview = email.preview();
         assert!(preview.starts_with("hello world é"));
         assert_eq!(preview.chars().count(), 110);
+    }
+
+    /// The preview exists to show what the app does, so the sample mailbox
+    /// has to actually contain the things it is showing.
+    #[test]
+    fn the_sample_mailbox_holds_a_real_conversation_and_something_archived() {
+        let messages = demo_messages();
+        let threads = crate::thread::group(&messages);
+        let conversation = threads
+            .iter()
+            .find(|thread| thread.messages.len() > 1)
+            .expect("the sample mailbox shows a threaded conversation");
+        assert_eq!(conversation.messages.len(), 3);
+        let folders: Vec<Folder> = conversation
+            .messages
+            .iter()
+            .map(|&index| messages[index].folder)
+            .collect();
+        assert!(
+            folders.contains(&Folder::Inbox) && folders.contains(&Folder::Sent),
+            "the sample conversation crosses both folders"
+        );
+        assert!(messages.iter().any(|email| email.archived));
     }
 
     #[test]

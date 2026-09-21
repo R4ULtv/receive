@@ -4,8 +4,7 @@
 //! itself in a tooltip. Folders and domains are separate groups that combine:
 //! Sent on `studio.dev` is the Sent slot and the `studio.dev` slot, both marked.
 
-use super::{Receive, Screen, theme};
-use crate::model::Folder;
+use super::{Receive, Screen, View, theme};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{button::*, tooltip::Tooltip, *};
 use gpui_kit::{prelude::*, *};
@@ -43,18 +42,29 @@ impl Receive {
                 "inbox",
                 "Inbox",
                 self.unread(),
-                reading && self.folder == Folder::Inbox,
+                reading && self.view == View::Inbox,
                 Icon::new(IconName::Inbox).small().into_any_element(),
-                |this, _, cx| this.navigate(Folder::Inbox, cx),
+                |this, _, cx| this.navigate(View::Inbox, cx),
                 cx,
             ))
             .child(self.slot(
                 "sent",
                 "Sent",
                 0,
-                reading && self.folder == Folder::Sent,
+                reading && self.view == View::Sent,
                 Icon::new(IconName::Send).small().into_any_element(),
-                |this, _, cx| this.navigate(Folder::Sent, cx),
+                |this, _, cx| this.navigate(View::Sent, cx),
+                cx,
+            ))
+            // Receive's own shelf, not a Resend folder: it holds mail filed
+            // away from either of them.
+            .child(self.slot(
+                "archive",
+                "Archive",
+                0,
+                reading && self.view == View::Archive,
+                Icon::new(IconName::Archive).small().into_any_element(),
+                |this, _, cx| this.navigate(View::Archive, cx),
                 cx,
             ))
             // One domain needs no picker: the folders already are the mailbox.

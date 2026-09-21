@@ -20,6 +20,7 @@ pub mod theme;
 use crate::{
     favicon::Icons,
     model::{Draft, Email, Folder, demo_messages},
+    thread::Thread,
     worker::{Command, Event, Worker},
 };
 use chrono::Datelike as _;
@@ -55,6 +56,28 @@ enum Screen {
     Settings,
 }
 
+/// Which conversations the list shows.
+///
+/// Inbox and Sent are Resend's two folders. Archive is Receive's own shelf and
+/// cuts across both: it holds whatever has been filed away, wherever it came
+/// from. Nothing here is a deletion — Resend still has every message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum View {
+    Inbox,
+    Sent,
+    Archive,
+}
+
+impl View {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Inbox => "Inbox",
+            Self::Sent => "Sent",
+            Self::Archive => "Archive",
+        }
+    }
+}
+
 /// A draft field that offers addresses while you type in it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Field {
@@ -71,7 +94,10 @@ pub struct Receive {
     icons_dirty: bool,
     data_dir: PathBuf,
     emails: Vec<Email>,
-    folder: Folder,
+    /// [`Self::emails`] grouped into conversations, rebuilt whenever the mail
+    /// changes rather than on every frame.
+    threads: Vec<Thread>,
+    view: View,
     /// The domain the list is narrowed to, or every domain when this is `None`.
     domain: Option<String>,
     /// Addresses saved by hand in Settings.
@@ -82,7 +108,11 @@ pub struct Receive {
     highlighted: usize,
     closing_suggestions: Option<Instant>,
     screen: Screen,
+    /// The key of the conversation being read.
     selected: Option<String>,
+    /// The id of the message shown open inside it. Without one, the newest
+    /// message of the conversation is the one open.
+    open_message: Option<String>,
     connected: bool,
     preview: bool,
     busy: bool,
@@ -198,7 +228,8 @@ impl Receive {
             icons_dirty: true,
             data_dir,
             emails: Vec::new(),
-            folder: Folder::Inbox,
+            threads: Vec::new(),
+            view: View::Inbox,
             domain: None,
             contacts: Vec::new(),
             suggesting: None,
@@ -206,6 +237,7 @@ impl Receive {
             closing_suggestions: None,
             screen: Screen::Mail,
             selected: None,
+            open_message: None,
             connected: false,
             preview: false,
             busy: false,
@@ -275,6 +307,7 @@ impl Receive {
                     self.preview = false;
                     self.emails = emails;
                     self.selected = None;
+                    self.open_message = None;
                     self.domain = None;
                     self.contacts = contacts;
                     self.screen = Screen::Mail;
@@ -287,6 +320,7 @@ impl Receive {
                     self.connected = false;
                     self.emails.clear();
                     self.selected = None;
+                    self.open_message = None;
                     self.domain = None;
                     self.contacts.clear();
                     self.icon_files.clear();
@@ -296,7 +330,7 @@ impl Receive {
                 }
                 Event::Snapshot(emails) => self.emails = emails,
                 Event::Updated(email) => {
-                    if self.selected.as_deref() == Some(&email.id) && self.folder == email.folder {
+                    if self.open_message.as_deref() == Some(&email.id) {
                         self.reader.update(cx, |state, cx| {
                             state.set_value(email.display_body(), window, cx)
                         });
@@ -323,8 +357,9 @@ impl Receive {
                         cx,
                     );
                     self.screen = Screen::Mail;
-                    self.folder = Folder::Sent;
+                    self.view = View::Sent;
                     self.selected = None;
+                    self.open_message = None;
                     self.error = None;
                 }
                 Event::Status(status) => self.status = status,
@@ -343,6 +378,7 @@ impl Receive {
                 }
             }
         }
+        self.rebuild_threads();
         cx.notify();
     }
 
@@ -441,36 +477,98 @@ impl Receive {
     fn show_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preview = true;
         self.emails = demo_messages();
-        self.folder = Folder::Inbox;
+        self.rebuild_threads();
+        self.view = View::Inbox;
         self.domain = None;
         self.screen = Screen::Mail;
         self.status = "Preview · sample messages".into();
-        self.select("demo-0".into(), window, cx);
+        if let Some(key) = self.thread_key_of("demo-0") {
+            self.select(key, window, cx);
+        }
     }
 
-    fn select(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = Some(id.clone());
-        if let Some(email) = self
-            .emails
-            .iter_mut()
-            .find(|e| e.id == id && e.folder == self.folder)
-        {
-            email.read = true;
-            self.reader.update(cx, |state, cx| {
-                state.set_value(email.display_body(), window, cx)
-            });
+    /// Group the mail into conversations.
+    ///
+    /// A conversation is named after its oldest message, so a message from
+    /// earlier in an exchange arriving late can rename the one being read.
+    /// The reader follows the message that is open rather than closing itself.
+    fn rebuild_threads(&mut self) {
+        self.threads = crate::thread::group(&self.emails);
+        let anchor = self.open_message.clone().or_else(|| self.selected.clone());
+        self.selected = anchor.and_then(|id| {
+            self.threads
+                .iter()
+                .find(|thread| {
+                    thread.key == id
+                        || thread
+                            .messages
+                            .iter()
+                            .any(|&index| self.emails[index].id == id)
+                })
+                .map(|thread| thread.key.clone())
+        });
+        if self.selected.is_none() {
+            self.open_message = None;
         }
+    }
+
+    /// The conversation a message belongs to.
+    ///
+    /// Conversations are named rather than numbered everywhere a click can
+    /// reach them: a sync between drawing a row and clicking it rebuilds the
+    /// list, and a position saved from the old one would open the wrong mail.
+    fn thread_key_of(&self, id: &str) -> Option<String> {
+        self.threads
+            .iter()
+            .find(|thread| thread.messages.iter().any(|&i| self.emails[i].id == id))
+            .map(|thread| thread.key.clone())
+    }
+
+    fn thread_by_key(&self, key: &str) -> Option<usize> {
+        self.threads.iter().position(|thread| thread.key == key)
+    }
+
+    /// Open a conversation, which reads all of it: it arrived as one exchange
+    /// and it is read as one.
+    fn select(&mut self, key: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_by_key(&key) else {
+            return;
+        };
+        self.selected = Some(key);
+        self.open_message = None;
+        self.mark_read(self.conversation(thread), true, cx);
+        if let Some(index) = self.open_email() {
+            self.show_message(index, window, cx);
+        }
+    }
+
+    /// Show one message of the conversation being read.
+    fn show(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.emails.iter().position(|email| email.id == id) {
+            self.show_message(index, window, cx);
+        }
+    }
+
+    fn show_message(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(email) = self.emails.get(index) else {
+            return;
+        };
+        let (id, folder, body) = (email.id.clone(), email.folder, email.display_body());
+        self.open_message = Some(id.clone());
+        self.reader
+            .update(cx, |state, cx| state.set_value(body, window, cx));
         if self.connected && !self.preview {
-            self.command(Command::Open(self.folder, id));
+            self.command(Command::Open(folder, id));
         }
         cx.notify();
     }
 
-    fn navigate(&mut self, folder: Folder, cx: &mut Context<Self>) {
+    fn navigate(&mut self, view: View, cx: &mut Context<Self>) {
         self.save_draft(cx);
-        self.folder = folder;
+        self.view = view;
         self.screen = Screen::Mail;
         self.selected = None;
+        self.open_message = None;
         cx.notify();
     }
 
@@ -480,6 +578,114 @@ impl Receive {
         self.domain = domain;
         self.screen = Screen::Mail;
         self.selected = None;
+        self.open_message = None;
+        cx.notify();
+    }
+
+    /// Mark messages read or unread, on screen and on disk.
+    fn mark_read(&mut self, messages: Vec<usize>, read: bool, cx: &mut Context<Self>) {
+        let mut changed = Vec::new();
+        for index in messages {
+            let email = &mut self.emails[index];
+            if email.read != read {
+                email.read = read;
+                changed.push((email.folder, email.id.clone()));
+            }
+        }
+        if !changed.is_empty() && self.connected && !self.preview {
+            self.command(Command::SetRead(changed, read));
+        }
+        cx.notify();
+    }
+
+    /// Turn a conversation's read mark over. A conversation that is only
+    /// partly read counts as unread, so one press finishes reading it.
+    fn toggle_read(&mut self, key: String, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_by_key(&key) else {
+            return;
+        };
+        let messages = self.conversation(thread);
+        if messages.iter().all(|&index| self.emails[index].read) {
+            self.mark_thread_unread(key, cx);
+        } else {
+            self.mark_read(messages, true, cx);
+        }
+    }
+
+    /// Mark a conversation unread and close it. Leaving it open would only
+    /// read it again.
+    fn mark_thread_unread(&mut self, key: String, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_by_key(&key) else {
+            return;
+        };
+        self.mark_read(self.conversation(thread), false, cx);
+        if self.selected.as_deref() == Some(key.as_str()) {
+            self.selected = None;
+            self.open_message = None;
+        }
+        cx.notify();
+    }
+
+    /// File a whole conversation away, or bring it back.
+    fn archive_thread(&mut self, key: String, archived: bool, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_by_key(&key) else {
+            return;
+        };
+        self.archive(self.conversation(thread), archived, cx);
+    }
+
+    /// File one message of a conversation away, or bring it back.
+    fn archive_message(&mut self, id: String, archived: bool, cx: &mut Context<Self>) {
+        if let Some(index) = self.emails.iter().position(|email| email.id == id) {
+            self.archive(vec![index], archived, cx);
+        }
+    }
+
+    /// File messages away, or bring them back.
+    ///
+    /// This is Receive's own shelf and nothing more: Resend still holds every
+    /// message, the Archive view still shows it, and a sync cannot pull it
+    /// back into the folder it came from.
+    fn archive(&mut self, messages: Vec<usize>, archived: bool, cx: &mut Context<Self>) {
+        let mut changed = Vec::new();
+        for index in messages {
+            let email = &mut self.emails[index];
+            if email.archived != archived {
+                email.archived = archived;
+                changed.push((email.folder, email.id.clone()));
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        let count = changed.len();
+        if self.connected && !self.preview {
+            self.command(Command::SetArchived(changed, archived));
+        }
+        // Close the reader only when what it was showing is what just left
+        // the view. Filing one conversation away from the list is no reason
+        // to shut another one.
+        let still_shown = match self.selected_thread() {
+            Some(thread) => {
+                let messages = self.conversation(thread);
+                self.open_message
+                    .as_ref()
+                    .is_none_or(|id| messages.iter().any(|&index| self.emails[index].id == *id))
+            }
+            None => false,
+        };
+        if !still_shown {
+            self.selected = None;
+            self.open_message = None;
+        }
+        self.status = match (archived, count) {
+            (true, 1) => "Archived on this computer. Resend still has it.".into(),
+            (true, count) => {
+                format!("Archived {count} messages on this computer. Resend still has them.")
+            }
+            (false, 1) => "Moved back to its folder.".into(),
+            (false, count) => format!("Moved {count} messages back to their folders."),
+        };
         cx.notify();
     }
 
@@ -490,31 +696,50 @@ impl Receive {
         cx.notify();
     }
 
-    /// The messages in the open folder that are on the chosen domain and match
-    /// the search field.
+    /// Whether a message belongs to the view being shown.
+    fn in_view(&self, email: &Email) -> bool {
+        match self.view {
+            View::Inbox => !email.archived && email.folder == Folder::Inbox,
+            View::Sent => !email.archived && email.folder == Folder::Sent,
+            View::Archive => email.archived,
+        }
+    }
+
+    /// The messages of a conversation, oldest first.
+    ///
+    /// This is the whole exchange across both folders, so a reply sits with
+    /// the message it answers. Only what the view itself hides is left out.
+    fn conversation(&self, thread: usize) -> Vec<usize> {
+        let archived = self.view == View::Archive;
+        self.threads
+            .get(thread)
+            .map(|thread| {
+                thread
+                    .messages
+                    .iter()
+                    .copied()
+                    .filter(|&index| self.emails[index].archived == archived)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The conversations in view: those with a message in this folder, on the
+    /// chosen domain, with something matching the search field.
     fn visible(&self, cx: &App) -> Vec<usize> {
         let query = self.search.read(cx).value().to_lowercase();
-        self.emails
+        self.threads
             .iter()
             .enumerate()
-            .filter(|(_, email)| {
-                email.folder == self.folder
-                    && self.on_domain(email)
-                    && (query.is_empty()
-                        || format!(
-                            "{} {} {} {} {}",
-                            email.from,
-                            email.to.join(" "),
-                            email.subject,
-                            email.text.as_deref().unwrap_or(""),
-                            if email.folder == Folder::Sent {
-                                email.delivery_status().label()
-                            } else {
-                                ""
-                            }
-                        )
-                        .to_lowercase()
-                        .contains(&query))
+            .filter(|(_, thread)| {
+                thread.messages.iter().any(|&index| {
+                    let email = &self.emails[index];
+                    self.in_view(email) && self.on_domain(email)
+                }) && (query.is_empty()
+                    || thread
+                        .messages
+                        .iter()
+                        .any(|&index| matches_query(&self.emails[index], &query)))
             })
             .map(|(index, _)| index)
             .collect()
@@ -724,7 +949,7 @@ impl Receive {
     fn unread(&self) -> usize {
         self.emails
             .iter()
-            .filter(|e| e.folder == Folder::Inbox && !e.read && self.on_domain(e))
+            .filter(|e| e.folder == Folder::Inbox && !e.read && !e.archived && self.on_domain(e))
             .count()
     }
 
@@ -733,7 +958,8 @@ impl Receive {
     fn domains(&self) -> Vec<(String, usize)> {
         let mut domains: BTreeMap<String, usize> = BTreeMap::new();
         for email in &self.emails {
-            let unread = usize::from(email.folder == Folder::Inbox && !email.read);
+            let unread =
+                usize::from(email.folder == Folder::Inbox && !email.read && !email.archived);
             for domain in email.domains() {
                 *domains.entry(domain).or_default() += unread;
             }
@@ -741,14 +967,33 @@ impl Receive {
         domains.into_iter().collect()
     }
 
-    fn selected_email(&self) -> Option<&Email> {
-        self.emails
-            .iter()
-            .find(|e| Some(&e.id) == self.selected.as_ref() && e.folder == self.folder)
+    /// The conversation being read, if it is still in view.
+    fn selected_thread(&self) -> Option<usize> {
+        let key = self.selected.as_ref()?;
+        let thread = self.threads.iter().position(|thread| &thread.key == key)?;
+        (!self.conversation(thread).is_empty()).then_some(thread)
+    }
+
+    /// The message shown open inside it: the one chosen, or the most recent.
+    fn open_email(&self) -> Option<usize> {
+        let messages = self.conversation(self.selected_thread()?);
+        self.open_message
+            .as_ref()
+            .and_then(|id| {
+                messages
+                    .iter()
+                    .copied()
+                    .find(|&index| self.emails[index].id == *id)
+            })
+            .or_else(|| messages.last().copied())
+    }
+
+    pub(super) fn reading(&self) -> Option<&Email> {
+        self.emails.get(self.open_email()?)
     }
 
     fn reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(email) = self.selected_email().cloned() else {
+        let Some(email) = self.reading().cloned() else {
             return;
         };
         if !self.draft.body.trim().is_empty() || !self.draft.to.trim().is_empty() {
@@ -918,8 +1163,10 @@ impl Receive {
         self.smoke_ticks += 1;
         match self.smoke_ticks {
             10 => {
-                self.folder = Folder::Sent;
-                self.select("demo-bounced".into(), window, cx);
+                self.view = View::Sent;
+                if let Some(key) = self.thread_key_of("demo-bounced") {
+                    self.select(key, window, cx);
+                }
             }
             20 => {
                 self.screen = Screen::Compose;
@@ -997,7 +1244,7 @@ impl Render for Receive {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.smoke_test {
             self.smoke_frames |= match self.screen {
-                Screen::Mail if self.folder == Folder::Sent => 8,
+                Screen::Mail if self.view == View::Sent => 8,
                 Screen::Mail => 1,
                 Screen::Compose => 2,
                 Screen::Settings => 4,
@@ -1031,6 +1278,24 @@ impl Render for Receive {
             )
             .child(self.status_bar(cx))
     }
+}
+
+/// Whether a message answers what was typed in the search field.
+fn matches_query(email: &Email, query: &str) -> bool {
+    format!(
+        "{} {} {} {} {}",
+        email.from,
+        email.to.join(" "),
+        email.subject,
+        email.text.as_deref().unwrap_or(""),
+        if email.folder == Folder::Sent {
+            email.delivery_status().label()
+        } else {
+            ""
+        }
+    )
+    .to_lowercase()
+    .contains(query)
 }
 
 /// What an address shows when its domain has no icon to show.

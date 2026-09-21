@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     time::{Duration, Instant},
@@ -21,6 +22,10 @@ pub enum Command {
     FlushDraft(Option<Draft>),
     SaveContacts(Vec<String>),
     Send(Draft),
+    /// Mark a conversation, or one message of it, read or unread.
+    SetRead(Vec<(Folder, String)>, bool),
+    /// File a conversation, or one message of it, away — or bring it back.
+    SetArchived(Vec<(Folder, String)>, bool),
 }
 
 pub enum Event {
@@ -149,7 +154,7 @@ fn run(
                         Command::Open(folder, id) => {
                             if let Some(api) = &mut api {
                                 let profile = api.credentials.profile.clone();
-                                store.mark_read(&profile, folder, &id)?;
+                                store.set_read(&profile, &[(folder, id.clone())], true)?;
                                 if let Some(mut email) = store.get(&profile, folder, &id)? {
                                     if !email.body_loaded {
                                         email = api.email(folder, &id)?;
@@ -175,6 +180,16 @@ fn run(
                             emit(events, Event::DraftFlushed);
                             return Ok(());
                         }
+                        Command::SetRead(messages, read) => {
+                            if let Some(api) = &api {
+                                store.set_read(&api.credentials.profile, &messages, read)?;
+                            }
+                        }
+                        Command::SetArchived(messages, archived) => {
+                            if let Some(api) = &api {
+                                store.set_archived(&api.credentials.profile, &messages, archived)?;
+                            }
+                        }
                         Command::SaveContacts(contacts) => {
                             if let Some(api) = &api {
                                 store.save_contacts(&api.credentials.profile, &contacts)?;
@@ -189,6 +204,15 @@ fn run(
                             // Persist the exact retry identity BEFORE attempting delivery.
                             store.save_draft(&api.credentials.profile, &draft)?;
                             let id = api.send(&draft)?;
+                            // Resend's sent mail carries no headers back, so
+                            // the only record that this answers something is
+                            // the one written here. Without it the reply can
+                            // never be threaded with the message it answers.
+                            let mut headers = BTreeMap::new();
+                            if let Some(answering) = &draft.in_reply_to {
+                                headers.insert("In-Reply-To".into(), answering.clone());
+                                headers.insert("References".into(), draft.references.clone());
+                            }
                             let sent = Email {
                                 id,
                                 from: draft.from.clone(),
@@ -200,6 +224,7 @@ fn run(
                                 read: true,
                                 body_loaded: true,
                                 last_event: Some(DeliveryStatus::Submitted),
+                                headers,
                                 ..Default::default()
                             };
                             store.put(&api.credentials.profile, &sent)?;

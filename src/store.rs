@@ -19,6 +19,19 @@ impl Store {
             CREATE INDEX IF NOT EXISTS message_date ON messages(profile, created_at DESC);
             CREATE INDEX IF NOT EXISTS pending_body ON messages(profile, created_at) WHERE body_loaded=0;
             CREATE TABLE IF NOT EXISTS settings (profile TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(profile, name));")?;
+        // `CREATE TABLE IF NOT EXISTS` leaves an archive made by an earlier
+        // version exactly as it was, so a column added later has to be asked
+        // for separately.
+        let known: i64 = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='archived'",
+            [],
+            |row| row.get(0),
+        )?;
+        if known == 0 {
+            db.execute_batch(
+                "ALTER TABLE messages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         Ok(Self { db })
     }
     pub fn put(&self, profile: &str, email: &Email) -> Result<()> {
@@ -30,6 +43,7 @@ impl Store {
                 data=json_set(
                     CASE WHEN excluded.body_loaded=1 OR messages.body_loaded=0 THEN excluded.data ELSE messages.data END,
                     '$.last_event', COALESCE(json_extract(excluded.data, '$.last_event'), json_extract(messages.data, '$.last_event')),
+                    '$.message_id', COALESCE(json_extract(excluded.data, '$.message_id'), json_extract(messages.data, '$.message_id')),
                     '$.status_checked_at', CASE WHEN json_extract(excluded.data, '$.last_event') IS NOT NULL
                         THEN json_extract(excluded.data, '$.status_checked_at')
                         ELSE json_extract(messages.data, '$.status_checked_at') END),
@@ -47,20 +61,22 @@ impl Store {
         Ok(())
     }
     pub fn list(&self, profile: &str) -> Result<Vec<Email>> {
-        let mut stmt = self.db.prepare("SELECT data,is_read,body_loaded FROM messages WHERE profile=?1 ORDER BY created_at DESC")?;
+        let mut stmt = self.db.prepare("SELECT data,is_read,body_loaded,archived FROM messages WHERE profile=?1 ORDER BY created_at DESC")?;
         let rows = stmt.query_map([profile], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, bool>(1)?,
                 row.get::<_, bool>(2)?,
+                row.get::<_, bool>(3)?,
             ))
         })?;
         let mut emails = rows
             .map(|row| {
-                let (data, read, loaded) = row?;
+                let (data, read, loaded, archived) = row?;
                 let mut email: Email = serde_json::from_str(&data)?;
                 email.read = read;
                 email.body_loaded = loaded;
+                email.archived = archived;
                 Ok(email)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -68,20 +84,52 @@ impl Store {
         Ok(emails)
     }
     pub fn get(&self, profile: &str, folder: Folder, id: &str) -> Result<Option<Email>> {
-        let row = self.db.query_row("SELECT data,is_read,body_loaded FROM messages WHERE profile=?1 AND folder=?2 AND id=?3", params![profile, folder.name(), id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,bool>(1)?, row.get::<_,bool>(2)?))).optional()?;
-        row.map(|(data, read, loaded)| {
+        let row = self.db.query_row("SELECT data,is_read,body_loaded,archived FROM messages WHERE profile=?1 AND folder=?2 AND id=?3", params![profile, folder.name(), id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,bool>(1)?, row.get::<_,bool>(2)?, row.get::<_,bool>(3)?))).optional()?;
+        row.map(|(data, read, loaded, archived)| {
             let mut email: Email = serde_json::from_str(&data)?;
             email.read = read;
             email.body_loaded = loaded;
+            email.archived = archived;
             Ok(email)
         })
         .transpose()
     }
-    pub fn mark_read(&self, profile: &str, folder: Folder, id: &str) -> Result<()> {
-        self.db.execute(
-            "UPDATE messages SET is_read=1 WHERE profile=?1 AND folder=?2 AND id=?3",
-            params![profile, folder.name(), id],
-        )?;
+    /// Mark messages read or unread.
+    pub fn set_read(&self, profile: &str, messages: &[(Folder, String)], read: bool) -> Result<()> {
+        self.set_flag(profile, messages, "is_read", read)
+    }
+    /// Move messages into the archive, or bring them back out of it.
+    ///
+    /// Archiving is Receive's own: Resend still holds the message, and a sync
+    /// will list it again. [`Self::put`] never writes this column, so being
+    /// listed again cannot pull an archived message back into the folder.
+    pub fn set_archived(
+        &self,
+        profile: &str,
+        messages: &[(Folder, String)],
+        archived: bool,
+    ) -> Result<()> {
+        self.set_flag(profile, messages, "archived", archived)
+    }
+    /// A whole conversation changes in one transaction, so an interrupted
+    /// write cannot leave half of it marked.
+    fn set_flag(
+        &self,
+        profile: &str,
+        messages: &[(Folder, String)],
+        column: &'static str,
+        value: bool,
+    ) -> Result<()> {
+        let transaction = self.db.unchecked_transaction()?;
+        // `column` is one of this function's own two call sites, never input.
+        let statement =
+            format!("UPDATE messages SET {column}=?4 WHERE profile=?1 AND folder=?2 AND id=?3");
+        for (folder, id) in messages {
+            self.db
+                .prepare_cached(&statement)?
+                .execute(params![profile, folder.name(), id, value])?;
+        }
+        transaction.commit()?;
         Ok(())
     }
     pub fn pending(&self, profile: &str) -> Result<Option<Email>> {
@@ -188,7 +236,7 @@ mod tests {
                     ..Default::default()
                 },
             )?;
-            db.mark_read("a", Folder::Sent, "sent")?;
+            db.set_read("a", &[(Folder::Sent, "sent".into())], true)?;
             for status in [
                 DeliveryStatus::Sent,
                 DeliveryStatus::Delivered,
@@ -250,7 +298,7 @@ mod tests {
             ..Default::default()
         };
         db.put("a", &email)?;
-        db.mark_read("a", Folder::Inbox, "1")?;
+        db.set_read("a", &[(Folder::Inbox, "1".into())], true)?;
         db.put(
             "a",
             &Email {
@@ -264,6 +312,106 @@ mod tests {
         assert!(db.list("b")?.is_empty());
         Ok(())
     }
+    /// The point of a local archive: Resend keeps listing the message, and
+    /// every sync writes it again, but it must not come back to the folder.
+    #[test]
+    fn syncing_cannot_pull_an_archived_message_back_into_its_folder() -> Result<()> {
+        let store = Store::open(Path::new(":memory:"))?;
+        let email = Email {
+            id: "1".into(),
+            subject: "Filed away".into(),
+            text: Some("Body".into()),
+            body_loaded: true,
+            ..Default::default()
+        };
+        store.put("a", &email)?;
+        store.set_archived("a", &[(Folder::Inbox, "1".into())], true)?;
+        store.set_read("a", &[(Folder::Inbox, "1".into())], false)?;
+
+        // Both shapes a sync writes: a list page without the body, and a full
+        // message fetched afterwards.
+        for body_loaded in [false, true] {
+            store.put(
+                "a",
+                &Email {
+                    id: "1".into(),
+                    subject: "Filed away".into(),
+                    body_loaded,
+                    ..Default::default()
+                },
+            )?;
+            let saved = store.get("a", Folder::Inbox, "1")?.unwrap();
+            assert!(saved.archived, "a sync unarchived the message");
+            assert!(!saved.read, "a sync marked the message read");
+        }
+        assert!(store.list("a")?[0].archived);
+
+        store.set_archived("a", &[(Folder::Inbox, "1".into())], false)?;
+        assert!(!store.get("a", Folder::Inbox, "1")?.unwrap().archived);
+        Ok(())
+    }
+
+    /// An archive written before archiving existed has no such column, and
+    /// opening it must add one rather than fail.
+    #[test]
+    fn an_archive_from_an_earlier_version_gains_the_column_on_open() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("mail.sqlite3");
+        {
+            let old = Connection::open(&path)?;
+            old.execute_batch(
+                "CREATE TABLE messages (
+                    profile TEXT NOT NULL, folder TEXT NOT NULL, id TEXT NOT NULL,
+                    created_at TEXT NOT NULL, data TEXT NOT NULL, is_read INTEGER NOT NULL DEFAULT 0,
+                    body_loaded INTEGER NOT NULL DEFAULT 0, retry_after INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(profile, folder, id));",
+            )?;
+            old.execute(
+                "INSERT INTO messages(profile,folder,id,created_at,data) VALUES ('a','Inbox','1','2026-04-01T00:00:00Z',?1)",
+                params![serde_json::to_string(&Email { id: "1".into(), ..Default::default() })?],
+            )?;
+        }
+        let store = Store::open(&path)?;
+        let kept = store.list("a")?;
+        assert_eq!(kept.len(), 1, "the existing mail survived the migration");
+        assert!(!kept[0].archived);
+        store.set_archived("a", &[(Folder::Inbox, "1".into())], true)?;
+        assert!(store.get("a", Folder::Inbox, "1")?.unwrap().archived);
+        // Opening again must not try to add the column a second time.
+        assert!(Store::open(&path)?.get("a", Folder::Inbox, "1")?.unwrap().archived);
+        Ok(())
+    }
+
+    /// A conversation is marked in one go, and an unwritable message takes the
+    /// rest of the conversation down with it rather than half-marking it.
+    #[test]
+    fn marking_a_conversation_is_all_or_nothing() -> Result<()> {
+        let store = Store::open(Path::new(":memory:"))?;
+        for id in ["1", "2"] {
+            store.put(
+                "a",
+                &Email {
+                    id: id.into(),
+                    ..Default::default()
+                },
+            )?;
+        }
+        let conversation = [
+            (Folder::Inbox, "1".to_string()),
+            (Folder::Inbox, "2".to_string()),
+        ];
+        store.set_read("a", &conversation, true)?;
+        assert!(store.list("a")?.iter().all(|email| email.read));
+
+        store.db.execute_batch("CREATE TRIGGER no_unread BEFORE UPDATE ON messages WHEN NEW.id='2' AND NEW.is_read=0 BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;")?;
+        assert!(store.set_read("a", &conversation, false).is_err());
+        assert!(
+            store.list("a")?.iter().all(|email| email.read),
+            "the first message stayed marked after the second failed"
+        );
+        Ok(())
+    }
+
     #[test]
     fn draft_and_sync_checkpoint_survive_reopening() -> Result<()> {
         let temp = tempfile::tempdir()?;

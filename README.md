@@ -7,7 +7,9 @@ A small desktop app for managing email across multiple domains on [Resend](https
 ## What it does
 
 - Brings your inbox and sent mail into one app, with filters for each domain.
+- Groups a back-and-forth into one conversation, so your reply sits with the message it answers.
 - Lets you write and reply to emails, with a draft saved as you go.
+- Marks conversations read or unread, and files them away in an Archive.
 - Shows delivery updates, such as delivered, delayed, or bounced.
 - Saves downloaded messages on your computer and lets you search them.
 - Checks for new mail while the app is open.
@@ -44,6 +46,10 @@ You can manage multiple domains within one connected Resend account. If you're s
 ## A few things to know
 
 Emails are displayed as plain text. Attachment names are shown, but uploading and downloading attachments aren't supported yet. You can open a message in the Resend dashboard to see more.
+
+Archiving is Receive's own, and happens only on this computer. Nothing is deleted: Resend keeps its copy, the message stays in your local archive, and the Archive view still shows it. Checking for mail won't pull an archived conversation back into your inbox.
+
+Conversations are grouped by the headers mail carries for the purpose. Resend doesn't return those headers for mail you've sent, so Receive records them itself as a reply goes out — messages sent before this version fall back to matching on subject and the people involved. Received mail groups properly once its full content has downloaded.
 
 Downloaded mail and drafts stay on your computer. The local mail archive isn't encrypted; login details are stored separately in your operating system's credential store. The app also fetches website icons for domains shown in the interface.
 

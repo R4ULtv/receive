@@ -4,4 +4,5 @@ pub mod diagnostics;
 pub mod favicon;
 pub mod model;
 pub mod store;
+pub mod thread;
 pub mod worker;

@@ -3,7 +3,7 @@
 #[cfg(target_os = "macos")]
 mod macos;
 mod ui;
-use receive::{diagnostics, favicon, model, worker};
+use receive::{diagnostics, favicon, model, thread, worker};
 
 use gpui_kit::component::{Root, TitleBar};
 use gpui_kit::*;

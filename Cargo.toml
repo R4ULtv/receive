@@ -12,7 +12,7 @@ anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
-gpui-kit = "=0.6.2"
+gpui-kit = "=0.6.6"
 html2text = "0.16"
 keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "charset", "form", "http2", "json", "query", "rustls", "system-proxy"] }
